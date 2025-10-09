@@ -12,7 +12,12 @@
   "dependencies": {
     "@types/node": "^24.7.0",
     "puppeteer": "^24.23.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@types/puppeteer": "^5.4.7"
   }
 }
