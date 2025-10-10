@@ -1,18 +1,17 @@
-import puppeteerExtra from "puppeteer-extra";
+// @ts-nocheck
+import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import fs from "fs";
 import { parse } from "json2csv";
-import type { Page, HTTPResponse } from "puppeteer";
 
-puppeteerExtra.use(StealthPlugin());
+puppeteer.use(StealthPlugin());
 
 const SELLER_URL = "https://jiji.co.ke/sellerpage-fpYsOXD7fz2sZqygUQ1Qtd6z";
 const OUTPUT_JSON = "ads.json";
+const OUTPUT_NEW_JSON = "new_ads.json";
 const OUTPUT_CSV = "ads.csv";
-const SCROLL_DELAY = 1500;
-const NETWORK_IDLE_TIMEOUT = 10000;
 
-interface RawAd {
+interface Ad {
   title: string;
   price: string;
   description: string;
@@ -21,109 +20,96 @@ interface RawAd {
   url: string;
 }
 
-/** Scroll repeatedly until no new ads appear */
-async function autoScroll(page: Page) {
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function autoScroll(page: any) {
   let lastHeight = await page.evaluate("document.body.scrollHeight");
-  let sameCount = 0;
-  while (sameCount < 5) {
+  let stableRounds = 0;
+  const maxStableRounds = 5;
+
+  while (stableRounds < maxStableRounds) {
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
-    await new Promise((res) => setTimeout(res, SCROLL_DELAY));
+    await delay(2000);
     const newHeight = await page.evaluate("document.body.scrollHeight");
-    if (newHeight === lastHeight) sameCount++;
-    else sameCount = 0;
-    lastHeight = newHeight;
+    if (newHeight === lastHeight) {
+      stableRounds++;
+    } else {
+      stableRounds = 0;
+      lastHeight = newHeight;
+    }
   }
 }
 
-/** Capture ads dynamically loaded through network XHRs */
-async function captureNetworkAds(page: Page): Promise<RawAd[]> {
-  const results: RawAd[] = [];
-  const seen = new Set<string>();
-  let lastResponseTime = Date.now();
-
-  page.on("response", async (res: HTTPResponse) => {
-    try {
-      const url = res.url();
-      if (!url.includes("/api_web/v1/items/list")) return;
-      const json = await res.json();
-      if (!json?.banners?.items) return;
-
-      json.banners.items.forEach((item: any) => {
-        const id = item.id;
-        if (seen.has(id)) return;
-        seen.add(id);
-        results.push({
-          title: item.title || "",
-          price: item.price?.value_text || "",
-          description: item.description || "",
-          location: item.region?.name || "",
-          image: item.image?.url || "",
-          url: `https://jiji.co.ke/${item.slug}-${item.id}`,
-        });
-      });
-      lastResponseTime = Date.now();
-    } catch {}
-  });
-
-  while (Date.now() - lastResponseTime < NETWORK_IDLE_TIMEOUT) {
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
-    await new Promise((res) => setTimeout(res, SCROLL_DELAY));
-  }
-
-  return results;
-}
-
-/** Fallback DOM scrape (static visible ads) */
-async function scrapeDOMAds(page: Page): Promise<RawAd[]> {
+async function scrapeAllAds(page: any): Promise<Ad[]> {
   return await page.$$eval(
     ".b-list-advert-base.b-list-advert-base--list.qa-advert-list-item",
-    (cards) =>
-      cards.map((el) => {
-        const title = el.querySelector(".b-advert-title-inner")?.textContent?.trim() || "";
-        const price = el.querySelector(".qa-advert-price")?.textContent?.trim() || "";
-        const description = el.querySelector(".b-list-advert-base__description-text")?.textContent?.trim() || "";
-        const location = el.querySelector(".b-list-advert__region__text")?.textContent?.trim() || "";
-        const image = el.querySelector("img")?.getAttribute("src") || "";
+    (cards: Element[]) =>
+      cards.map((el: Element) => {
+        const title =
+          (el.querySelector(".b-advert-title-inner")?.textContent || "").trim();
+        const price =
+          (el.querySelector(".qa-advert-price")?.textContent || "").trim();
+        const description =
+          (el.querySelector(".b-list-advert-base__description-text")
+            ?.textContent || "").trim();
+        const location =
+          (el.querySelector(".b-list-advert__region__text")?.textContent || "").trim();
+        const image = (el.querySelector("img") as HTMLImageElement)?.src || "";
         const url = (el.closest("a") as HTMLAnchorElement)?.href || "";
+
         return { title, price, description, location, image, url };
       })
   );
 }
 
-/** Main scraper */
+function mergeAndDetectNewAds(existingAds: Ad[], newAds: Ad[]): {
+  allAds: Ad[];
+  newOnly: Ad[];
+} {
+  const existingUrls = new Set(existingAds.map((a) => a.url));
+  const newOnly = newAds.filter((a) => !existingUrls.has(a.url));
+  const allAds = [...existingAds, ...newOnly];
+  return { allAds, newOnly };
+}
+
 async function scrapeJiji() {
-  const browser = await puppeteerExtra.launch({
+  console.log(`🌍 Opening seller page...`);
+  const browser = await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
   const page = await browser.newPage();
-  await page.setViewport({ width: 1366, height: 768 });
 
-  console.log(`🌍 Opening seller page (network capture enabled)...`);
   await page.goto(SELLER_URL, { waitUntil: "domcontentloaded" });
-
-  // capture ads via network
-  const networkPromise = captureNetworkAds(page);
+  console.log(`🔄 Scrolling to load all ads...`);
   await autoScroll(page);
-  const networkAds = await networkPromise;
 
-  let ads: RawAd[] = [];
-  if (networkAds.length > 0) {
-    console.log(`✅ Captured ${networkAds.length} ads via network requests.`);
-    ads = networkAds;
-  } else {
-    console.log(`⚠️ Network capture found nothing — falling back to DOM scrape.`);
-    ads = await scrapeDOMAds(page);
+  console.log(`📸 Extracting ads...`);
+  const scrapedAds = await scrapeAllAds(page);
+  console.log(`✅ Scraped ${scrapedAds.length} ads from page.`);
+
+  let existingAds: Ad[] = [];
+  if (fs.existsSync(OUTPUT_JSON)) {
+    existingAds = JSON.parse(fs.readFileSync(OUTPUT_JSON, "utf-8"));
   }
 
-  // dedupe
-  const unique = Array.from(new Map(ads.map((a) => [a.url, a])).values());
-  console.log(`✅ Final aggregated ads: ${unique.length}`);
+  const { allAds, newOnly } = mergeAndDetectNewAds(existingAds, scrapedAds);
 
-  fs.writeFileSync(OUTPUT_JSON, JSON.stringify(unique, null, 2));
-  fs.writeFileSync(OUTPUT_CSV, parse(unique));
-  console.log(`💾 Saved ${unique.length} ads to ${OUTPUT_JSON} and ${OUTPUT_CSV}`);
+  // Save updated main ads
+  fs.writeFileSync(OUTPUT_JSON, JSON.stringify(allAds, null, 2));
+  fs.writeFileSync(OUTPUT_CSV, parse(allAds));
 
+  // Save new ads separately if any
+  if (newOnly.length > 0) {
+    fs.writeFileSync(OUTPUT_NEW_JSON, JSON.stringify(newOnly, null, 2));
+    console.log(`🆕 ${newOnly.length} new ads detected and saved to ${OUTPUT_NEW_JSON}`);
+  } else {
+    console.log("✅ No new ads found — everything is up to date!");
+  }
+
+  console.log(`📦 Total ads in store: ${allAds.length}`);
   await browser.close();
 }
 
