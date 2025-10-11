@@ -1,4 +1,3 @@
-// src/scrapper.ts
 import fs from "fs";
 import path from "path";
 import * as puppeteer from "puppeteer";
@@ -67,6 +66,7 @@ async function autoScroll(page: puppeteer.Page) {
 
 /**
  * 🧠 Extract full ad data including lazy-loaded images
+ * — includes image deduplication
  */
 async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
   return page.evaluate(() => {
@@ -90,9 +90,15 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
           if (u) urls.push(u);
         });
       }
-
       return urls;
     };
+
+    // Helper to normalize image URLs for deduplication
+    const normalizeImageUrl = (url: string) =>
+      url
+        .replace(/\?.*$/, "") // remove query params
+        .replace(/\/+$/, "") // remove trailing slashes
+        .trim();
 
     return adElements
       .map((el) => {
@@ -101,13 +107,14 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
         const price =
           el.querySelector(".qa-advert-price")?.textContent?.trim() || "";
         const description =
-          el.querySelector(".b-list-advert-base__description-text")?.textContent?.trim() || "";
+          el.querySelector(".b-list-advert-base__description-text")?.textContent?.trim() ||
+          "";
         const location =
           el.querySelector(".b-list-advert__region__text")?.textContent?.trim() || "";
         const link = (el.closest("a") as HTMLAnchorElement)?.href || "";
 
         // 🖼️ Collect *every* possible image source
-        const images = Array.from(el.querySelectorAll("img"))
+        const rawImages = Array.from(el.querySelectorAll("img"))
           .flatMap((img) => getAllImageUrls(img))
           .filter(
             (src) =>
@@ -119,7 +126,12 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
               !src.endsWith(".svg")
           );
 
-        if (!title || !price || !link || images.length === 0) return null;
+        // 🚫 Deduplicate normalized image URLs
+        const uniqueImages = Array.from(
+          new Set(rawImages.map((url) => normalizeImageUrl(url)))
+        );
+
+        if (!title || !price || !link || uniqueImages.length === 0) return null;
 
         return {
           title,
@@ -127,24 +139,11 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
           description,
           location,
           link,
-          main_image: images[0],
-          other_images: images.slice(1),
+          main_image: uniqueImages[0],
+          other_images: uniqueImages.slice(1),
         };
       })
       .filter(Boolean) as Ad[];
-  });
-}
-
-/**
- * 🚫 Deduplicate ads across runs
- */
-function deduplicateAds(ads: Ad[]): Ad[] {
-  const seen = new Set<string>();
-  return ads.filter((ad) => {
-    const id = ad.link.split("?")[0]; // ignore query params
-    if (seen.has(id)) return false;
-    seen.add(id);
-    return true;
   });
 }
 
@@ -226,22 +225,58 @@ async function saveCSV(ads: Ad[]) {
   const scrapedAds = await scrapeAllAds(page);
   console.log(`✅ Scraped ${scrapedAds.length} ads from page.`);
 
+  // Quick image summary per ad
+  scrapedAds.forEach((ad) =>
+    console.log(`🖼️ ${ad.title}: ${1 + ad.other_images.length} unique image(s)`)
+  );
+
   // --- Load previous ads
   let existingAds: Ad[] = [];
   if (fs.existsSync(ADS_JSON)) {
-    existingAds = JSON.parse(fs.readFileSync(ADS_JSON, "utf-8"));
+    try {
+      existingAds = JSON.parse(fs.readFileSync(ADS_JSON, "utf-8"));
+    } catch {
+      existingAds = [];
+    }
   }
 
-  const merged = deduplicateAds([...existingAds, ...scrapedAds]);
+  // Normalize link comparison
+  const normalizeLink = (url: string) =>
+    url.replace(/\?.*$/, "").replace(/\/+$/, "").toLowerCase();
+
+  // Identify new ads
   const newAds = scrapedAds.filter(
-    (ad) => !existingAds.some((e) => e.link.split("?")[0] === ad.link.split("?")[0])
+    (ad) => !existingAds.some((e) => normalizeLink(e.link) === normalizeLink(ad.link))
   );
 
+  // Merge old + new uniquely
+  const mergedMap = new Map<string, Ad>();
+  [...existingAds, ...scrapedAds].forEach((ad) => {
+    mergedMap.set(normalizeLink(ad.link), ad);
+  });
+  const merged = Array.from(mergedMap.values());
+
+  // 🧠 Download images for new ads
   for (const ad of newAds) {
-    const filename = path.basename(ad.main_image).split("?")[0] || `img_${Date.now()}.jpg`;
-    ad.main_image_local = await enhanceImage(ad.main_image, filename);
+    console.log(`📥 Processing new ad: ${ad.title}`);
+    const mainFilename = path.basename(ad.main_image).split("?")[0] || `img_${Date.now()}.jpg`;
+    ad.main_image_local = await enhanceImage(ad.main_image, mainFilename);
+
+    const localOtherImages: string[] = [];
+    for (const [i, imgUrl] of ad.other_images.entries()) {
+      try {
+        const imgFilename = `${path.parse(mainFilename).name}_extra_${i}${path.extname(imgUrl) || ".jpg"}`;
+        const localPath = await enhanceImage(imgUrl, imgFilename);
+        if (localPath) localOtherImages.push(localPath);
+        await delay(1500);
+      } catch {
+        // ignore
+      }
+    }
+    ad.other_images = localOtherImages;
   }
 
+  // 💾 Write updates
   if (newAds.length > 0) {
     fs.writeFileSync(NEW_ADS_JSON, JSON.stringify(newAds, null, 2));
     console.log(`🆕 ${newAds.length} new ads detected and saved.`);
@@ -252,6 +287,6 @@ async function saveCSV(ads: Ad[]) {
   fs.writeFileSync(ADS_JSON, JSON.stringify(merged, null, 2));
   await saveCSV(merged);
 
-  console.log(`📦 Total unique ads in store: ${merged.length}`);
+  console.log(`📦 Total ads in store: ${merged.length}`);
   await browser.close();
 })();
