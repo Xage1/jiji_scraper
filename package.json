@@ -10,16 +10,20 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@types/node": "^24.7.0",
+    "csv-writer": "^1.6.0",
     "json2csv": "^6.0.0-alpha.2",
-    "puppeteer": "^24.23.0",
+    "node-fetch": "^2.7.0",
+    "puppeteer": "^24.24.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "sharp": "^0.34.4"
   },
   "devDependencies": {
     "@types/json2csv": "^5.0.7",
-    "@types/puppeteer": "^5.4.7"
+    "@types/node": "^24.7.1",
+    "@types/node-fetch": "^2.6.13",
+    "@types/puppeteer": "^5.4.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   }
 }
