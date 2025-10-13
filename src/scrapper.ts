@@ -26,18 +26,13 @@ async function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * 🔁 Deep scrolling logic to load *all* ads patiently.
- */
 async function autoScroll(page: puppeteer.Page) {
   console.log("🔄 Starting deep scroll for all ads...");
   let previousCount = 0;
   let sameCountRounds = 0;
   const maxSameRounds = 20;
   const scrollPause = 2500;
-  const maxRuntime = 10 * 60 * 1000; // 10 minutes
 
-  const start = Date.now();
   while (sameCountRounds < maxSameRounds) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await delay(scrollPause);
@@ -48,6 +43,7 @@ async function autoScroll(page: puppeteer.Page) {
           ".b-list-advert-base.b-list-advert-base--list.qa-advert-list-item"
         ).length
     );
+
     console.log(`🌀 Currently loaded ads: ${adCount}`);
 
     if (adCount === previousCount) sameCountRounds++;
@@ -55,19 +51,11 @@ async function autoScroll(page: puppeteer.Page) {
       previousCount = adCount;
       sameCountRounds = 0;
     }
-
-    if (Date.now() - start > maxRuntime) {
-      console.warn("⚠️ Max runtime reached, stopping scroll.");
-      break;
-    }
   }
+
   console.log(`✅ Finished scrolling. Total ads visible: ${previousCount}`);
 }
 
-/**
- * 🧠 Extract full ad data including lazy-loaded images
- * — includes image deduplication
- */
 async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
   return page.evaluate(() => {
     const adElements = Array.from(
@@ -93,12 +81,8 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
       return urls;
     };
 
-    // Helper to normalize image URLs for deduplication
     const normalizeImageUrl = (url: string) =>
-      url
-        .replace(/\?.*$/, "") // remove query params
-        .replace(/\/+$/, "") // remove trailing slashes
-        .trim();
+      url.replace(/\?.*$/, "").replace(/\/+$/, "").trim();
 
     return adElements
       .map((el) => {
@@ -107,13 +91,12 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
         const price =
           el.querySelector(".qa-advert-price")?.textContent?.trim() || "";
         const description =
-          el.querySelector(".b-list-advert-base__description-text")?.textContent?.trim() ||
-          "";
+          el.querySelector(".b-list-advert-base__description-text")
+            ?.textContent?.trim() || "";
         const location =
           el.querySelector(".b-list-advert__region__text")?.textContent?.trim() || "";
         const link = (el.closest("a") as HTMLAnchorElement)?.href || "";
 
-        // 🖼️ Collect *every* possible image source
         const rawImages = Array.from(el.querySelectorAll("img"))
           .flatMap((img) => getAllImageUrls(img))
           .filter(
@@ -126,7 +109,6 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
               !src.endsWith(".svg")
           );
 
-        // 🚫 Deduplicate normalized image URLs
         const uniqueImages = Array.from(
           new Set(rawImages.map((url) => normalizeImageUrl(url)))
         );
@@ -147,9 +129,6 @@ async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
   });
 }
 
-/**
- * 🧩 Enhance and save image locally
- */
 async function enhanceImage(url: string, filename: string) {
   try {
     const response = await fetch(url);
@@ -169,9 +148,6 @@ async function enhanceImage(url: string, filename: string) {
   }
 }
 
-/**
- * 💾 Save to CSV
- */
 async function saveCSV(ads: Ad[]) {
   const csvWriter = createObjectCsvWriter({
     path: ADS_CSV,
@@ -189,12 +165,8 @@ async function saveCSV(ads: Ad[]) {
   await csvWriter.writeRecords(ads);
 }
 
-/**
- * 🚀 Main runner
- */
 (async () => {
   console.log("🌍 Opening seller page...");
-
   const browser = await puppeteer.launch({
     headless: true,
     args: [
@@ -210,27 +182,16 @@ async function saveCSV(ads: Ad[]) {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
 
-  try {
-    await page.goto(SELLER_URL, { waitUntil: "networkidle2", timeout: 180000 });
-  } catch {
-    console.warn("⚠️ Page load failed — retrying...");
-    await delay(4000);
-    await page.goto(SELLER_URL, { waitUntil: "domcontentloaded", timeout: 240000 });
-  }
+  await page.goto(SELLER_URL, { waitUntil: "domcontentloaded", timeout: 240000 });
 
   console.log("🔄 Scrolling to load all ads...");
   await autoScroll(page);
 
   console.log("📸 Extracting ads...");
   const scrapedAds = await scrapeAllAds(page);
-  console.log(`✅ Scraped ${scrapedAds.length} ads from page.`);
+  console.log(`✅ Scraped ${scrapedAds.length} ads.`);
 
-  // Quick image summary per ad
-  scrapedAds.forEach((ad) =>
-    console.log(`🖼️ ${ad.title}: ${1 + ad.other_images.length} unique image(s)`)
-  );
-
-  // --- Load previous ads
+  // Load existing ads
   let existingAds: Ad[] = [];
   if (fs.existsSync(ADS_JSON)) {
     try {
@@ -240,23 +201,14 @@ async function saveCSV(ads: Ad[]) {
     }
   }
 
-  // Normalize link comparison
   const normalizeLink = (url: string) =>
     url.replace(/\?.*$/, "").replace(/\/+$/, "").toLowerCase();
 
-  // Identify new ads
   const newAds = scrapedAds.filter(
     (ad) => !existingAds.some((e) => normalizeLink(e.link) === normalizeLink(ad.link))
   );
 
-  // Merge old + new uniquely
-  const mergedMap = new Map<string, Ad>();
-  [...existingAds, ...scrapedAds].forEach((ad) => {
-    mergedMap.set(normalizeLink(ad.link), ad);
-  });
-  const merged = Array.from(mergedMap.values());
-
-  // 🧠 Download images for new ads
+  // Process new ads fully
   for (const ad of newAds) {
     console.log(`📥 Processing new ad: ${ad.title}`);
     const mainFilename = path.basename(ad.main_image).split("?")[0] || `img_${Date.now()}.jpg`;
@@ -264,24 +216,27 @@ async function saveCSV(ads: Ad[]) {
 
     const localOtherImages: string[] = [];
     for (const [i, imgUrl] of ad.other_images.entries()) {
-      try {
-        const imgFilename = `${path.parse(mainFilename).name}_extra_${i}${path.extname(imgUrl) || ".jpg"}`;
-        const localPath = await enhanceImage(imgUrl, imgFilename);
-        if (localPath) localOtherImages.push(localPath);
-        await delay(1500);
-      } catch {
-        // ignore
-      }
+      const imgFilename = `${path.parse(mainFilename).name}_extra_${i}${path.extname(imgUrl) || ".jpg"}`;
+      const localPath = await enhanceImage(imgUrl, imgFilename);
+      if (localPath) localOtherImages.push(localPath);
+      await delay(800);
     }
     ad.other_images = localOtherImages;
   }
 
-  // 💾 Write updates
+  // Merge updated ads including enhanced images
+  const mergedMap = new Map<string, Ad>();
+  [...existingAds, ...newAds, ...scrapedAds].forEach((ad) => {
+    mergedMap.set(normalizeLink(ad.link), ad);
+  });
+
+  const merged = Array.from(mergedMap.values());
+
   if (newAds.length > 0) {
     fs.writeFileSync(NEW_ADS_JSON, JSON.stringify(newAds, null, 2));
     console.log(`🆕 ${newAds.length} new ads detected and saved.`);
   } else {
-    console.log("🔁 No new ads — all up to date!");
+    console.log("🔁 No new ads found.");
   }
 
   fs.writeFileSync(ADS_JSON, JSON.stringify(merged, null, 2));
