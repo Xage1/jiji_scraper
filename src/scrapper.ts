@@ -6,10 +6,10 @@ import sharp from "sharp";
 import fetch from "node-fetch";
 
 const ADS_JSON = path.join("ads.json");
-const NEW_ADS_JSON = path.join("new_ads.json");
 const ADS_CSV = path.join("ads.csv");
 const IMAGES_DIR = path.join("images");
 const SELLER_URL = "https://jiji.co.ke/sellerpage-fpYsOXD7fz2sZqygUQ1Qtd6z";
+const CONCURRENCY = 15; // how many ad pages to scrape at once
 
 interface Ad {
   title: string;
@@ -27,15 +27,13 @@ async function delay(ms: number) {
 }
 
 async function autoScroll(page: puppeteer.Page) {
-  console.log("🔄 Starting deep scroll for all ads...");
+  console.log("🔄 Scrolling seller page...");
   let previousCount = 0;
   let sameCountRounds = 0;
-  const maxSameRounds = 20;
-  const scrollPause = 2500;
 
-  while (sameCountRounds < maxSameRounds) {
+  while (sameCountRounds < 10) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await delay(scrollPause);
+    await delay(2500);
 
     const adCount = await page.evaluate(
       () =>
@@ -43,8 +41,7 @@ async function autoScroll(page: puppeteer.Page) {
           ".b-list-advert-base.b-list-advert-base--list.qa-advert-list-item"
         ).length
     );
-
-    console.log(`🌀 Currently loaded ads: ${adCount}`);
+    console.log(`🌀 Loaded ads: ${adCount}`);
 
     if (adCount === previousCount) sameCountRounds++;
     else {
@@ -53,116 +50,98 @@ async function autoScroll(page: puppeteer.Page) {
     }
   }
 
-  console.log(`✅ Finished scrolling. Total ads visible: ${previousCount}`);
+  console.log(`✅ Finished scrolling. Total: ${previousCount}`);
 }
 
-async function scrapeAllAds(page: puppeteer.Page): Promise<Ad[]> {
+async function scrapeListing(page: puppeteer.Page): Promise<Ad[]> {
   return page.evaluate(() => {
-    const adElements = Array.from(
-      document.querySelectorAll(
-        ".b-list-advert-base.b-list-advert-base--list.qa-advert-list-item"
-      )
+    const ads: Ad[] = [];
+    const adEls = document.querySelectorAll(
+      ".b-list-advert-base.b-list-advert-base--list.qa-advert-list-item"
     );
-
-    const getAllImageUrls = (img: HTMLImageElement) => {
-      const urls: string[] = [];
-      const src = img.getAttribute("src");
-      const dataSrc = img.getAttribute("data-src");
-      const srcset = img.getAttribute("srcset");
-
-      if (src) urls.push(src);
-      if (dataSrc) urls.push(dataSrc);
-      if (srcset) {
-        srcset.split(",").forEach((part) => {
-          const u = part.trim().split(" ")[0];
-          if (u) urls.push(u);
-        });
-      }
-      return urls;
-    };
-
-    const normalizeImageUrl = (url: string) =>
-      url.replace(/\?.*$/, "").replace(/\/+$/, "").trim();
-
-    return adElements
-      .map((el) => {
-        const title =
-          el.querySelector(".b-advert-title-inner")?.textContent?.trim() || "";
-        const price =
-          el.querySelector(".qa-advert-price")?.textContent?.trim() || "";
-        const description =
-          el.querySelector(".b-list-advert-base__description-text")
-            ?.textContent?.trim() || "";
-        const location =
-          el.querySelector(".b-list-advert__region__text")?.textContent?.trim() || "";
-        const link = (el.closest("a") as HTMLAnchorElement)?.href || "";
-
-        const rawImages = Array.from(el.querySelectorAll("img"))
-          .flatMap((img) => getAllImageUrls(img))
-          .filter(
-            (src) =>
-              src &&
-              !src.includes("crown") &&
-              !src.includes("badge") &&
-              !src.includes("placeholder") &&
-              !src.includes("data:image") &&
-              !src.endsWith(".svg")
-          );
-
-        const uniqueImages = Array.from(
-          new Set(rawImages.map((url) => normalizeImageUrl(url)))
-        );
-
-        if (!title || !price || !link || uniqueImages.length === 0) return null;
-
-        return {
+    adEls.forEach((el) => {
+      const title =
+        el.querySelector(".b-advert-title-inner")?.textContent?.trim() || "";
+      const price =
+        el.querySelector(".qa-advert-price")?.textContent?.trim() || "";
+      const description =
+        el.querySelector(".b-list-advert-base__description-text")
+          ?.textContent?.trim() || "";
+      const location =
+        el.querySelector(".b-list-advert__region__text")?.textContent?.trim() ||
+        "";
+      const link = (el.closest("a") as HTMLAnchorElement)?.href || "";
+      const img = el.querySelector("img") as HTMLImageElement;
+      const main_image = img?.getAttribute("src") || "";
+      if (title && price && link && main_image) {
+        ads.push({
           title,
           price,
           description,
           location,
           link,
-          main_image: uniqueImages[0],
-          other_images: uniqueImages.slice(1),
-        };
-      })
-      .filter(Boolean) as Ad[];
+          main_image,
+          other_images: [],
+        });
+      }
+    });
+    return ads;
   });
 }
 
-async function enhanceImage(url: string, filename: string) {
+async function scrapeAdImages(page: puppeteer.Page, url: string): Promise<string[]> {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
+    await delay(2000);
+    const imgs = await page.evaluate(() => {
+      const urls: string[] = [];
+      document.querySelectorAll("img").forEach((img) => {
+        const src = img.getAttribute("src");
+        if (
+          src &&
+          src.startsWith("https") &&
+          !src.includes("badge") &&
+          !src.includes("placeholder") &&
+          !src.includes("svg") &&
+          !src.includes("data:image")
+        ) {
+          urls.push(src.split("?")[0]);
+        }
+      });
+      return Array.from(new Set(urls));
+    });
+    return imgs;
+  } catch {
+    return [];
+  }
+}
+
+async function enhanceImage(url: string, savePath: string) {
   try {
     const response = await fetch(url);
     const buffer = Buffer.from(await response.arrayBuffer());
     const enhanced = await sharp(buffer)
       .resize({ width: 1000, height: 1000, fit: "inside" })
-      .sharpen()
       .jpeg({ quality: 90 })
       .toBuffer();
-
-    fs.mkdirSync(IMAGES_DIR, { recursive: true });
-    const filepath = path.join(IMAGES_DIR, filename);
-    fs.writeFileSync(filepath, enhanced);
-    return filepath;
+    fs.writeFileSync(savePath, enhanced);
+    return savePath;
   } catch {
     return null;
   }
 }
 
-async function saveCSV(ads: Ad[]) {
-  const csvWriter = createObjectCsvWriter({
-    path: ADS_CSV,
-    header: [
-      { id: "title", title: "Title" },
-      { id: "price", title: "Price" },
-      { id: "link", title: "Link" },
-      { id: "main_image", title: "MainImage" },
-      { id: "main_image_local", title: "LocalImage" },
-      { id: "other_images", title: "OtherImages" },
-      { id: "description", title: "Description" },
-      { id: "location", title: "Location" },
-    ],
-  });
-  await csvWriter.writeRecords(ads);
+function sanitize(name: string) {
+  return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 80).trim();
+}
+
+// helper: split array into chunks
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const result = [];
+  for (let i = 0; i < arr.length; i += size) {
+    result.push(arr.slice(i, i + size));
+  }
+  return result;
 }
 
 (async () => {
@@ -176,72 +155,80 @@ async function saveCSV(ads: Ad[]) {
       "--window-size=1366,768",
     ],
   });
-
   const page = await browser.newPage();
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
 
   await page.goto(SELLER_URL, { waitUntil: "domcontentloaded", timeout: 240000 });
-
-  console.log("🔄 Scrolling to load all ads...");
   await autoScroll(page);
 
-  console.log("📸 Extracting ads...");
-  const scrapedAds = await scrapeAllAds(page);
-  console.log(`✅ Scraped ${scrapedAds.length} ads.`);
+  console.log("📋 Scraping listing data...");
+  const ads = await scrapeListing(page);
+  console.log(`✅ Found ${ads.length} ads in listing.`);
 
-  // Load existing ads
-  let existingAds: Ad[] = [];
-  if (fs.existsSync(ADS_JSON)) {
-    try {
-      existingAds = JSON.parse(fs.readFileSync(ADS_JSON, "utf-8"));
-    } catch {
-      existingAds = [];
+  fs.mkdirSync(IMAGES_DIR, { recursive: true });
+
+  const adChunks = chunkArray(ads, CONCURRENCY);
+  let processed = 0;
+
+  for (const chunk of adChunks) {
+    console.log(`⚙️ Processing ${chunk.length} ads in parallel...`);
+    const results = await Promise.allSettled(
+      chunk.map(async (ad) => {
+        const page = await browser.newPage();
+        const folder = path.join(IMAGES_DIR, sanitize(ad.title));
+        fs.mkdirSync(folder, { recursive: true });
+
+        const allImgs = await scrapeAdImages(page, ad.link);
+        if (allImgs.length > 0) {
+          ad.main_image = allImgs[0];
+          ad.other_images = allImgs.slice(1);
+        }
+
+        const mainPath = path.join(folder, "main.jpg");
+        ad.main_image_local = await enhanceImage(ad.main_image, mainPath);
+
+        const localExtras: string[] = [];
+        for (const [i, imgUrl] of ad.other_images.entries()) {
+          const extraPath = path.join(folder, `extra_${i + 1}.jpg`);
+          const saved = await enhanceImage(imgUrl, extraPath);
+          if (saved) localExtras.push(saved);
+          await delay(300);
+        }
+        ad.other_images = localExtras;
+
+        await page.close();
+        processed++;
+        console.log(`✅ Done [${processed}/${ads.length}] - ${ad.title}`);
+        return ad;
+      })
+    );
+
+    // Merge completed ads
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value) {
+        Object.assign(ads.find((a) => a.title === r.value.title)!, r.value);
+      }
     }
   }
 
-  const normalizeLink = (url: string) =>
-    url.replace(/\?.*$/, "").replace(/\/+$/, "").toLowerCase();
+  fs.writeFileSync(ADS_JSON, JSON.stringify(ads, null, 2));
 
-  const newAds = scrapedAds.filter(
-    (ad) => !existingAds.some((e) => normalizeLink(e.link) === normalizeLink(ad.link))
-  );
-
-  // Process new ads fully
-  for (const ad of newAds) {
-    console.log(`📥 Processing new ad: ${ad.title}`);
-    const mainFilename = path.basename(ad.main_image).split("?")[0] || `img_${Date.now()}.jpg`;
-    ad.main_image_local = await enhanceImage(ad.main_image, mainFilename);
-
-    const localOtherImages: string[] = [];
-    for (const [i, imgUrl] of ad.other_images.entries()) {
-      const imgFilename = `${path.parse(mainFilename).name}_extra_${i}${path.extname(imgUrl) || ".jpg"}`;
-      const localPath = await enhanceImage(imgUrl, imgFilename);
-      if (localPath) localOtherImages.push(localPath);
-      await delay(800);
-    }
-    ad.other_images = localOtherImages;
-  }
-
-  // Merge updated ads including enhanced images
-  const mergedMap = new Map<string, Ad>();
-  [...existingAds, ...newAds, ...scrapedAds].forEach((ad) => {
-    mergedMap.set(normalizeLink(ad.link), ad);
+  const csvWriter = createObjectCsvWriter({
+    path: ADS_CSV,
+    header: [
+      { id: "title", title: "Title" },
+      { id: "price", title: "Price" },
+      { id: "link", title: "Link" },
+      { id: "main_image_local", title: "MainImageLocal" },
+      { id: "other_images", title: "OtherImages" },
+      { id: "description", title: "Description" },
+      { id: "location", title: "Location" },
+    ],
   });
+  await csvWriter.writeRecords(ads);
 
-  const merged = Array.from(mergedMap.values());
-
-  if (newAds.length > 0) {
-    fs.writeFileSync(NEW_ADS_JSON, JSON.stringify(newAds, null, 2));
-    console.log(`🆕 ${newAds.length} new ads detected and saved.`);
-  } else {
-    console.log("🔁 No new ads found.");
-  }
-
-  fs.writeFileSync(ADS_JSON, JSON.stringify(merged, null, 2));
-  await saveCSV(merged);
-
-  console.log(`📦 Total ads in store: ${merged.length}`);
+  console.log("✅ All scraping done with concurrency =", CONCURRENCY);
   await browser.close();
 })();
