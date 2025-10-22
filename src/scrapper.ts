@@ -9,7 +9,7 @@ const ADS_JSON = path.join("ads.json");
 const ADS_CSV = path.join("ads.csv");
 const IMAGES_DIR = path.join("images");
 const SELLER_URL = "https://jiji.co.ke/sellerpage-fpYsOXD7fz2sZqygUQ1Qtd6z";
-const CONCURRENCY = 15; // how many ad pages to scrape at once
+const CONCURRENCY = 15;
 
 interface Ad {
   title: string;
@@ -135,12 +135,9 @@ function sanitize(name: string) {
   return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "").slice(0, 80).trim();
 }
 
-// helper: split array into chunks
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const result = [];
-  for (let i = 0; i < arr.length; i += size) {
-    result.push(arr.slice(i, i + size));
-  }
+  for (let i = 0; i < arr.length; i += size) result.push(arr.slice(i, i + size));
   return result;
 }
 
@@ -155,6 +152,7 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
       "--window-size=1366,768",
     ],
   });
+
   const page = await browser.newPage();
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -169,8 +167,42 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 
   fs.mkdirSync(IMAGES_DIR, { recursive: true });
 
-  const adChunks = chunkArray(ads, CONCURRENCY);
-  let processed = 0;
+  // 🟡 Load existing data for resume
+  let existingAds: Ad[] = [];
+  if (fs.existsSync(ADS_JSON)) {
+    try {
+      existingAds = JSON.parse(fs.readFileSync(ADS_JSON, "utf-8"));
+      console.log(`♻️ Loaded ${existingAds.length} previously scraped ads from ads.json`);
+    } catch {
+      console.log("⚠️ Failed to parse ads.json, starting fresh.");
+      existingAds = [];
+    }
+  }
+
+  // 🧠 Build lookup sets
+  const scrapedTitles = new Set(existingAds.map((a) => sanitize(a.title).toLowerCase()));
+  const existingFolders = new Set(
+    fs
+      .readdirSync(IMAGES_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name.toLowerCase())
+  );
+
+  // 🧩 Determine ads to scrape
+  const toScrape = ads.filter((ad) => {
+    const cleanTitle = sanitize(ad.title).toLowerCase();
+    const folder = path.join(IMAGES_DIR, cleanTitle);
+    const mainPath = path.join(folder, "main.jpg");
+    return (
+      !scrapedTitles.has(cleanTitle) &&
+      !(existingFolders.has(cleanTitle) && fs.existsSync(mainPath))
+    );
+  });
+
+  console.log(`🧩 ${toScrape.length} ads remaining to scrape after smart resume.`);
+
+  const adChunks = chunkArray(toScrape, CONCURRENCY);
+  let processed = existingAds.length;
 
   for (const chunk of adChunks) {
     console.log(`⚙️ Processing ${chunk.length} ads in parallel...`);
@@ -201,20 +233,20 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
         await page.close();
         processed++;
         console.log(`✅ Done [${processed}/${ads.length}] - ${ad.title}`);
+
+        // 🔁 Save progress incrementally (avoid duplicates)
+        if (!scrapedTitles.has(sanitize(ad.title).toLowerCase())) {
+          existingAds.push(ad);
+          scrapedTitles.add(sanitize(ad.title).toLowerCase());
+          fs.writeFileSync(ADS_JSON, JSON.stringify(existingAds, null, 2));
+        }
+
         return ad;
       })
     );
-
-    // Merge completed ads
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value) {
-        Object.assign(ads.find((a) => a.title === r.value.title)!, r.value);
-      }
-    }
   }
 
-  fs.writeFileSync(ADS_JSON, JSON.stringify(ads, null, 2));
-
+  // ✅ Export CSV after completion
   const csvWriter = createObjectCsvWriter({
     path: ADS_CSV,
     header: [
@@ -227,7 +259,7 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
       { id: "location", title: "Location" },
     ],
   });
-  await csvWriter.writeRecords(ads);
+  await csvWriter.writeRecords(existingAds);
 
   console.log("✅ All scraping done with concurrency =", CONCURRENCY);
   await browser.close();
